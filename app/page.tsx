@@ -281,6 +281,13 @@ export default function Home() {
   const animationFrameRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const audioSourcesRef = useRef<Map<string, MediaStreamAudioSourceNode>>(
+    new Map(),
+  );
+  const audioTrackIdsRef = useRef<Set<string>>(new Set());
+  const recordingOutputStreamRef = useRef<MediaStream | null>(null);
+  const modeRef = useRef<CaptureMode>(mode);
   const directoryHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const floatingPrompterWindowRef = useRef<Window | null>(null);
   const libraryUrlsRef = useRef<string[]>([]);
@@ -874,13 +881,14 @@ export default function Home() {
       context.fillStyle = "#050607";
       context.fillRect(0, 0, canvas.width, canvas.height);
 
-      if (captureMode === "camera" && camera) {
+      const activeMode = modeRef.current;
+      if (activeMode === "camera" && camera) {
         drawCover(context, camera, 0, 0, canvas.width, canvas.height);
       } else if (screen) {
         drawContain(context, screen, canvas.width, canvas.height);
       }
 
-      if (captureMode === "composite" && camera && cameraEnabled) {
+      if (activeMode === "composite" && camera && cameraEnabled) {
         const pip = pipPositionRef.current;
         const pipWidth = canvas.width * pip.width;
         const pipHeight = pipWidth * (9 / 16);
@@ -922,10 +930,40 @@ export default function Home() {
     };
   };
 
+  const addAudioStreamToMixer = (stream: MediaStream) => {
+    const audioTracks = stream
+      .getAudioTracks()
+      .filter((track) => track.enabled && !audioTrackIdsRef.current.has(track.id));
+    if (!audioTracks.length) return;
+
+    const outputStream = recordingOutputStreamRef.current;
+    const audioContext = audioContextRef.current;
+    const destination = audioDestinationRef.current;
+    if (!outputStream) return;
+
+    if (!audioContext || !destination) {
+      audioTracks.forEach((track) => {
+        outputStream.addTrack(track);
+        audioTrackIdsRef.current.add(track.id);
+      });
+      return;
+    }
+
+    audioTracks.forEach((track) => {
+      const source = audioContext.createMediaStreamSource(new MediaStream([track]));
+      source.connect(destination);
+      audioSourcesRef.current.set(track.id, source);
+      audioTrackIdsRef.current.add(track.id);
+    });
+  };
+
   const addMixedAudio = async (
     outputStream: MediaStream,
     sourceStreams: MediaStream[],
   ) => {
+    recordingOutputStreamRef.current = outputStream;
+    audioTrackIdsRef.current.clear();
+    audioSourcesRef.current.clear();
     const audioTracks = sourceStreams.flatMap((stream) =>
       stream.getAudioTracks().filter((track) => track.enabled),
     );
@@ -939,7 +977,10 @@ export default function Home() {
         }
       ).webkitAudioContext;
     if (!AudioContextClass) {
-      outputStream.addTrack(audioTracks[0]);
+      audioTracks.forEach((track) => {
+        outputStream.addTrack(track);
+        audioTrackIdsRef.current.add(track.id);
+      });
       return;
     }
 
@@ -947,11 +988,13 @@ export default function Home() {
     audioContextRef.current = audioContext;
     await audioContext.resume();
     const destination = audioContext.createMediaStreamDestination();
+    audioDestinationRef.current = destination;
 
     audioTracks.forEach((track) => {
-      const stream = new MediaStream([track]);
-      const source = audioContext.createMediaStreamSource(stream);
+      const source = audioContext.createMediaStreamSource(new MediaStream([track]));
       source.connect(destination);
+      audioSourcesRef.current.set(track.id, source);
+      audioTrackIdsRef.current.add(track.id);
     });
     destination.stream.getAudioTracks().forEach((track) => {
       outputStream.addTrack(track);
@@ -1052,6 +1095,11 @@ export default function Home() {
           outputStream.getTracks().forEach((track) => track.stop());
           void audioContextRef.current?.close();
           audioContextRef.current = null;
+          audioSourcesRef.current.forEach((source) => source.disconnect());
+          audioSourcesRef.current.clear();
+          audioDestinationRef.current = null;
+          audioTrackIdsRef.current.clear();
+          recordingOutputStreamRef.current = null;
 
           const finalMime = recorder.mimeType || mimeType;
           if (!finalMime.toLowerCase().includes("mp4")) {
@@ -1093,6 +1141,7 @@ export default function Home() {
       );
 
       recorder.start(1000);
+      modeRef.current = mode;
       setElapsedSeconds(0);
       setRecorderState("recording");
       setStatusMessage("正在录制 · 所有画面只在本机合成");
@@ -1145,16 +1194,56 @@ export default function Home() {
     }
   };
 
-  const changeMode = (nextMode: CaptureMode) => {
-    if (isBusy) return;
-    setMode(nextMode);
+  const changeMode = async (nextMode: CaptureMode) => {
+    if (recorderState === "countdown" || recorderState === "processing") return;
+    const previousMode = modeRef.current;
     setErrorMessage("");
-    if (nextMode === "camera") {
-      setStatusMessage("摄像头会占满最终画面");
-    } else if (nextMode === "screen") {
-      setStatusMessage("摄像头仅用于监看，不会进入成片");
-    } else {
-      setStatusMessage("屏幕与人像会合成在同一个视频里");
+
+    try {
+      if (nextMode !== "camera" && !screenStreamRef.current?.active) {
+        setStatusMessage("正在申请屏幕权限…");
+        await openScreen();
+      }
+
+      if (nextMode !== "camera") {
+        screenStreamRef.current?.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
+        if (mediaRecorderRef.current?.state === "recording") {
+          addAudioStreamToMixer(screenStreamRef.current as MediaStream);
+        }
+      } else {
+        screenStreamRef.current?.getAudioTracks().forEach((track) => {
+          track.enabled = false;
+        });
+      }
+
+      modeRef.current = nextMode;
+      setMode(nextMode);
+      if (nextMode === "camera") {
+        setStatusMessage(isRecording ? "已切换为摄像头成片" : "摄像头会占满最终画面");
+      } else if (nextMode === "screen") {
+        setStatusMessage(
+          isRecording ? "已切换为录屏成片" : "摄像头仅用于监看，不会进入成片",
+        );
+      } else {
+        setStatusMessage(
+          isRecording ? "已切换为录屏 + 人像成片" : "屏幕与人像会合成在同一个视频里",
+        );
+      }
+    } catch (error) {
+      modeRef.current = previousMode;
+      setMode(previousMode);
+      if (
+        error instanceof Error &&
+        error.message === "ENTIRE_SCREEN_SELECTED"
+      ) {
+        setErrorMessage(
+          "为了不把提词器录进去，请选择单个窗口或标签页，不要选择整个屏幕。",
+        );
+      } else {
+        setFriendlyError(error, "没有成功切换录制模式，请再试一次。");
+      }
     }
   };
 
@@ -1234,7 +1323,7 @@ export default function Home() {
                   type="button"
                   className={mode === item.id ? "active" : ""}
                   onClick={() => changeMode(item.id)}
-                  disabled={isBusy}
+                  disabled={recorderState === "countdown" || recorderState === "processing"}
                   aria-pressed={mode === item.id}
                   title={item.description}
                 >
