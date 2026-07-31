@@ -222,6 +222,10 @@ input:focus-visible {
   animation-delay: 70ms;
 }
 
+.teleprompter.library-mode {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
 .stage-heading {
   min-height: 56px;
   justify-content: space-between;
@@ -627,6 +631,15 @@ input:focus-visible {
   box-shadow: 0 0 0 3px rgba(114, 183, 139, 0.08);
 }
 
+.device-status span.unsupported {
+  color: #e98f87;
+}
+
+.device-status span.unsupported i {
+  background: var(--record);
+  box-shadow: 0 0 0 3px rgba(240, 76, 63, 0.08);
+}
+
 .primary-controls {
   display: flex;
   align-items: stretch;
@@ -637,7 +650,8 @@ input:focus-visible {
 .record-button,
 .quick-toggles button,
 .reset-script,
-.autoscroll-button {
+.autoscroll-button,
+.floating-prompter-button {
   border: 1px solid var(--rule);
   background: var(--raised);
   cursor: pointer;
@@ -651,7 +665,8 @@ input:focus-visible {
 .setup-button:hover:not(:disabled),
 .quick-toggles button:hover:not(:disabled),
 .reset-script:hover,
-.autoscroll-button:hover {
+.autoscroll-button:hover,
+.floating-prompter-button:hover {
   border-color: #555b5f;
   background: #222629;
 }
@@ -659,7 +674,8 @@ input:focus-visible {
 .setup-button:active:not(:disabled),
 .record-button:active:not(:disabled),
 .quick-toggles button:active:not(:disabled),
-.autoscroll-button:active {
+.autoscroll-button:active,
+.floating-prompter-button:active {
   transform: translateY(1px);
 }
 
@@ -770,6 +786,22 @@ input:focus-visible {
   text-underline-offset: 3px;
 }
 
+.status-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-actions button {
+  border: 0;
+  background: transparent;
+  color: var(--ready);
+  cursor: pointer;
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .teleprompter-heading {
   min-height: 76px;
   justify-content: space-between;
@@ -777,14 +809,74 @@ input:focus-visible {
   border-bottom: 1px solid var(--rule);
 }
 
-.teleprompter h2 {
-  font-size: 25px;
+.side-panel-tabs {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  gap: 4px;
+}
+
+.side-panel-tabs button {
+  position: relative;
+  display: grid;
+  min-width: 87px;
+  align-content: center;
+  gap: 2px;
+  padding: 0 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  font-size: 14px;
+  transition:
+    border-color 160ms ease,
+    color 160ms ease,
+    background 160ms ease;
+}
+
+.side-panel-tabs button small {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  letter-spacing: 0.13em;
+}
+
+.side-panel-tabs button:hover,
+.side-panel-tabs button.active {
+  color: var(--paper);
+}
+
+.side-panel-tabs button.active {
+  border-bottom-color: var(--record);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.side-panel-tabs button b {
+  position: absolute;
+  top: 8px;
+  right: 7px;
+  display: grid;
+  min-width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(240, 76, 63, 0.16);
+  color: #ff746a;
+  font-family: var(--font-mono);
+  font-size: 7px;
 }
 
 .reset-script {
   padding: 7px 9px;
   color: var(--muted);
   font-size: 9px;
+}
+
+.reset-script:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
 .script-window {
@@ -950,6 +1042,176 @@ input[type="range"]::-webkit-slider-thumb {
 .autoscroll-button.active .toggle-track i {
   background: #fff4ef;
   transform: translateX(15px);
+}
+
+.floating-prompter-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  text-align: left;
+}
+
+.floating-prompter-button > span:first-child {
+  display: grid;
+  width: 32px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid rgba(114, 183, 139, 0.42);
+  color: var(--ready);
+  font-family: var(--font-mono);
+  font-size: 15px;
+}
+
+.floating-prompter-button > span:last-child {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+}
+
+.floating-prompter-button small {
+  color: var(--ready);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.recording-library {
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+  scrollbar-color: #45494c transparent;
+  scrollbar-width: thin;
+}
+
+.folder-card {
+  position: relative;
+  padding: 18px;
+  border: 1px solid #34383b;
+  background:
+    linear-gradient(135deg, rgba(114, 183, 139, 0.07), transparent 48%),
+    #121415;
+}
+
+.folder-card::after {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 9px;
+  height: 9px;
+  border-top: 1px solid var(--ready);
+  border-right: 1px solid var(--ready);
+  content: "";
+}
+
+.folder-card strong {
+  display: block;
+  margin-top: 7px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.folder-card > p:not(.eyebrow) {
+  margin: 9px 0 14px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.folder-card button {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(114, 183, 139, 0.46);
+  background: rgba(114, 183, 139, 0.08);
+  color: #b9dec4;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.library-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.library-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.library-list-heading small {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  letter-spacing: 0.12em;
+}
+
+.empty-library {
+  display: grid;
+  min-height: 210px;
+  place-content: center;
+  justify-items: center;
+  border: 1px dashed #34383b;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-library > span {
+  color: #33383b;
+  font-family: var(--font-mono);
+  font-size: 38px;
+  font-weight: 800;
+}
+
+.empty-library strong {
+  margin-top: 10px;
+  color: #d7d4ce;
+  font-size: 14px;
+}
+
+.empty-library p {
+  margin: 6px 0 0;
+  font-size: 9px;
+}
+
+.recording-card {
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  background: #0e1011;
+}
+
+.recording-card video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #050607;
+  object-fit: contain;
+}
+
+.recording-card > div {
+  display: grid;
+  gap: 4px;
+  padding: 11px 12px 12px;
+}
+
+.recording-card strong {
+  overflow: hidden;
+  color: #dbd8d1;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-card span {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 8px;
 }
 
 .teleprompter-footer {

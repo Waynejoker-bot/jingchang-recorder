@@ -10,12 +10,51 @@ import {
 
 type CaptureMode = "camera" | "screen" | "composite";
 type RecorderState = "idle" | "countdown" | "recording" | "processing";
+type SidePanel = "script" | "library";
 
 type PipPosition = {
   x: number;
   y: number;
   width: number;
 };
+
+type DirectoryHandleWithPermission = FileSystemDirectoryHandle & {
+  entries: () => AsyncIterableIterator<[string, FileSystemHandle]>;
+  queryPermission?: (options: {
+    mode: "read" | "readwrite";
+  }) => Promise<PermissionState>;
+  requestPermission?: (options: {
+    mode: "read" | "readwrite";
+  }) => Promise<PermissionState>;
+};
+
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: (options?: {
+    id?: string;
+    mode?: "read" | "readwrite";
+  }) => Promise<FileSystemDirectoryHandle>;
+};
+
+type DocumentPictureInPictureWindow = Window & {
+  documentPictureInPicture?: {
+    requestWindow: (options?: {
+      width?: number;
+      height?: number;
+      disallowReturnToOpener?: boolean;
+    }) => Promise<Window>;
+  };
+};
+
+type RecordingLibraryItem = {
+  name: string;
+  size: number;
+  lastModified: number;
+  url: string;
+};
+
+const DIRECTORY_DB = "jingchang-local-library";
+const DIRECTORY_STORE = "handles";
+const DIRECTORY_KEY = "recordings-directory";
 
 const DEFAULT_SCRIPT = `今天我想分享一个，我最近在做产品时非常真实的判断。
 
@@ -51,6 +90,55 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 };
 
+const formatFileDate = (timestamp: number) =>
+  new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp);
+
+const openDirectoryDatabase = () =>
+  new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(DIRECTORY_DB, 1);
+    request.addEventListener("upgradeneeded", () => {
+      if (!request.result.objectStoreNames.contains(DIRECTORY_STORE)) {
+        request.result.createObjectStore(DIRECTORY_STORE);
+      }
+    });
+    request.addEventListener("success", () => resolve(request.result));
+    request.addEventListener("error", () => reject(request.error));
+  });
+
+const rememberDirectoryHandle = async (
+  handle: FileSystemDirectoryHandle,
+) => {
+  const database = await openDirectoryDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(DIRECTORY_STORE, "readwrite");
+    transaction.objectStore(DIRECTORY_STORE).put(handle, DIRECTORY_KEY);
+    transaction.addEventListener("complete", () => resolve());
+    transaction.addEventListener("error", () => reject(transaction.error));
+  });
+  database.close();
+};
+
+const restoreDirectoryHandle = async () => {
+  const database = await openDirectoryDatabase();
+  const handle = await new Promise<FileSystemDirectoryHandle | null>(
+    (resolve, reject) => {
+      const transaction = database.transaction(DIRECTORY_STORE, "readonly");
+      const request = transaction.objectStore(DIRECTORY_STORE).get(DIRECTORY_KEY);
+      request.addEventListener("success", () => {
+        resolve((request.result as FileSystemDirectoryHandle | undefined) || null);
+      });
+      request.addEventListener("error", () => reject(request.error));
+    },
+  );
+  database.close();
+  return handle;
+};
+
 const stopStream = (stream: MediaStream | null) => {
   stream?.getTracks().forEach((track) => track.stop());
 };
@@ -63,11 +151,11 @@ const attachStream = (video: HTMLVideoElement | null, stream: MediaStream | null
   }
 };
 
-const chooseMimeType = () => {
+const chooseMp4MimeType = () => {
   const candidates = [
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm",
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4;codecs=avc1.42001E,mp4a.40.2",
+    "video/mp4;codecs=h264,aac",
     "video/mp4",
   ];
   return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) || "";
@@ -158,6 +246,14 @@ export default function Home() {
   const [fontSize, setFontSize] = useState(24);
   const [scrollSpeed, setScrollSpeed] = useState(2);
   const [autoScroll, setAutoScroll] = useState(false);
+  const [mp4Ready, setMp4Ready] = useState<boolean | null>(null);
+  const [sidePanel, setSidePanel] = useState<SidePanel>("script");
+  const [directoryName, setDirectoryName] = useState("");
+  const [directoryNeedsPermission, setDirectoryNeedsPermission] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [recordingLibrary, setRecordingLibrary] = useState<
+    RecordingLibraryItem[]
+  >([]);
   const [pipPosition, setPipPosition] = useState<PipPosition>({
     x: 0.035,
     y: 0.69,
@@ -184,6 +280,9 @@ export default function Home() {
   const animationFrameRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const directoryHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
+  const floatingPrompterWindowRef = useRef<Window | null>(null);
+  const libraryUrlsRef = useRef<string[]>([]);
   const pipPositionRef = useRef(pipPosition);
   const dragRef = useRef<{
     startX: number;
@@ -196,9 +295,291 @@ export default function Home() {
   const isBusy = recorderState !== "idle";
   const isRecording = recorderState === "recording";
 
+  const refreshRecordingLibrary = useCallback(
+    async (handle = directoryHandleRef.current) => {
+      if (!handle) {
+        setRecordingLibrary([]);
+        return;
+      }
+
+      const permissionHandle = handle as DirectoryHandleWithPermission;
+      const permission = permissionHandle.queryPermission
+        ? await permissionHandle.queryPermission({ mode: "readwrite" })
+        : "granted";
+      if (permission !== "granted") {
+        setDirectoryNeedsPermission(true);
+        return;
+      }
+
+      setLibraryLoading(true);
+      try {
+        const items: RecordingLibraryItem[] = [];
+        for await (const [name, entry] of permissionHandle.entries()) {
+          if (entry.kind !== "file" || !name.toLowerCase().endsWith(".mp4")) {
+            continue;
+          }
+          try {
+            const file = await (entry as FileSystemFileHandle).getFile();
+            items.push({
+              name,
+              size: file.size,
+              lastModified: file.lastModified,
+              url: URL.createObjectURL(file),
+            });
+          } catch {
+            // The file may have been moved or deleted while the folder was read.
+          }
+        }
+
+        items.sort((a, b) => b.lastModified - a.lastModified);
+        libraryUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+        libraryUrlsRef.current = items.map((item) => item.url);
+        setRecordingLibrary(items);
+        setDirectoryNeedsPermission(false);
+      } finally {
+        setLibraryLoading(false);
+      }
+    },
+    [],
+  );
+
+  const chooseRecordingDirectory = useCallback(async () => {
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    if (!picker) {
+      throw new Error("FOLDER_UNSUPPORTED");
+    }
+
+    const handle = await picker({
+      id: "jingchang-recordings",
+      mode: "readwrite",
+    });
+    directoryHandleRef.current = handle;
+    setDirectoryName(handle.name);
+    setDirectoryNeedsPermission(false);
+    await rememberDirectoryHandle(handle);
+    await refreshRecordingLibrary(handle);
+    return handle;
+  }, [refreshRecordingLibrary]);
+
+  const ensureRecordingDirectory = useCallback(async () => {
+    const current = directoryHandleRef.current;
+    if (!current) return chooseRecordingDirectory();
+
+    const permissionHandle = current as DirectoryHandleWithPermission;
+    const existingPermission = permissionHandle.queryPermission
+      ? await permissionHandle.queryPermission({ mode: "readwrite" })
+      : "granted";
+    if (existingPermission === "granted") return current;
+
+    const requestedPermission = permissionHandle.requestPermission
+      ? await permissionHandle.requestPermission({ mode: "readwrite" })
+      : "denied";
+    if (requestedPermission === "granted") {
+      setDirectoryNeedsPermission(false);
+      await refreshRecordingLibrary(current);
+      return current;
+    }
+
+    return chooseRecordingDirectory();
+  }, [chooseRecordingDirectory, refreshRecordingLibrary]);
+
+  const saveRecordingToDirectory = async (blob: Blob, name: string) => {
+    const directory = directoryHandleRef.current;
+    if (!directory) throw new Error("FOLDER_REQUIRED");
+    const fileHandle = await directory.getFileHandle(name, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  };
+
+  const openFloatingPrompter = async () => {
+    setErrorMessage("");
+    const script = scriptRef.current?.value || DEFAULT_SCRIPT;
+    const pictureInPictureApi = (
+      window as DocumentPictureInPictureWindow
+    ).documentPictureInPicture;
+    let prompterWindow: Window | null = null;
+
+    try {
+      if (pictureInPictureApi) {
+        prompterWindow = await pictureInPictureApi.requestWindow({
+          width: 440,
+          height: 720,
+          disallowReturnToOpener: false,
+        });
+      } else {
+        prompterWindow = window.open(
+          "",
+          "jingchang-floating-prompter",
+          "popup=yes,width=440,height=720",
+        );
+      }
+      if (!prompterWindow) throw new Error("PROMPTER_BLOCKED");
+      const activePrompterWindow = prompterWindow;
+
+      if (
+        floatingPrompterWindowRef.current &&
+        floatingPrompterWindowRef.current !== activePrompterWindow
+      ) {
+        floatingPrompterWindowRef.current.close();
+      }
+      floatingPrompterWindowRef.current = activePrompterWindow;
+      const prompterDocument = activePrompterWindow.document;
+      prompterDocument.title = "镜场 · 悬浮提词器";
+      prompterDocument.body.innerHTML = `
+        <main class="prompter-shell">
+          <header>
+            <div>
+              <small>镜场 / FLOATING SCRIPT</small>
+              <strong>悬浮提词器</strong>
+            </div>
+            <button type="button" data-action="close">关闭</button>
+          </header>
+          <section class="script" aria-label="提词内容"></section>
+          <footer>
+            <button type="button" data-action="smaller">A−</button>
+            <button type="button" data-action="toggle">开始滚动</button>
+            <button type="button" data-action="slower">慢一点</button>
+            <button type="button" data-action="faster">快一点</button>
+            <button type="button" data-action="larger">A＋</button>
+          </footer>
+        </main>
+      `;
+
+      const style = prompterDocument.createElement("style");
+      style.textContent = `
+        :root { color-scheme: dark; }
+        * { box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #090a0b; }
+        body { color: #f1eee8; font-family: "Avenir Next", "PingFang SC", sans-serif; }
+        button { color: inherit; font: inherit; cursor: pointer; }
+        .prompter-shell { display: grid; grid-template-rows: 68px minmax(0, 1fr) 62px; height: 100%; border: 1px solid #2b2f33; }
+        header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #2b2f33; background: #111315; }
+        header div { display: grid; gap: 3px; }
+        header small { color: #f04c3f; font: 700 8px "SFMono-Regular", monospace; letter-spacing: .14em; }
+        header strong { font-size: 16px; letter-spacing: .04em; }
+        header button, footer button { border: 1px solid #34383b; background: #1b1e20; }
+        header button { padding: 7px 9px; color: #9b9fa1; font-size: 10px; }
+        .script { overflow: auto; padding: 32px 24px 55vh; background: repeating-linear-gradient(0deg, transparent 0, transparent 47px, rgba(255,255,255,.025) 48px); font-family: "Songti SC", "STSong", serif; font-size: 30px; line-height: 1.72; white-space: pre-wrap; scrollbar-width: thin; scrollbar-color: #45494c transparent; }
+        footer { display: grid; grid-template-columns: 48px 1.3fr 1fr 1fr 48px; gap: 5px; padding: 9px; border-top: 1px solid #2b2f33; background: #111315; }
+        footer button { min-width: 0; padding: 8px 4px; font-size: 10px; }
+        footer button[data-action="toggle"] { border-color: #f04c3f; background: #f04c3f; color: white; font-weight: 700; }
+      `;
+      prompterDocument.head.appendChild(style);
+
+      const scriptElement =
+        prompterDocument.querySelector<HTMLElement>(".script");
+      if (!scriptElement) throw new Error("PROMPTER_FAILED");
+      scriptElement.textContent = script;
+
+      let isScrolling = false;
+      let speed = 38;
+      let fontSize = 30;
+      let previous = activePrompterWindow.performance.now();
+      let frame = 0;
+      const tick = (now: number) => {
+        if (isScrolling) {
+          const delta = Math.min(now - previous, 50);
+          scriptElement.scrollTop += (speed * delta) / 1000;
+        }
+        previous = now;
+        frame = activePrompterWindow.requestAnimationFrame(tick);
+      };
+      frame = activePrompterWindow.requestAnimationFrame(tick);
+
+      const actionButtons =
+        prompterDocument.querySelectorAll<HTMLButtonElement>("[data-action]");
+      actionButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const action = button.dataset.action;
+          if (action === "close") activePrompterWindow.close();
+          if (action === "smaller") {
+            fontSize = Math.max(20, fontSize - 2);
+            scriptElement.style.fontSize = `${fontSize}px`;
+          }
+          if (action === "larger") {
+            fontSize = Math.min(52, fontSize + 2);
+            scriptElement.style.fontSize = `${fontSize}px`;
+          }
+          if (action === "slower") speed = Math.max(12, speed - 8);
+          if (action === "faster") speed = Math.min(110, speed + 8);
+          if (action === "toggle") {
+            isScrolling = !isScrolling;
+            button.textContent = isScrolling ? "暂停滚动" : "开始滚动";
+          }
+        });
+      });
+      activePrompterWindow.addEventListener(
+        "pagehide",
+        () => {
+          activePrompterWindow.cancelAnimationFrame(frame);
+          if (floatingPrompterWindowRef.current === activePrompterWindow) {
+            floatingPrompterWindowRef.current = null;
+          }
+        },
+        { once: true },
+      );
+      setStatusMessage(
+        pictureInPictureApi
+          ? "提词器已悬浮置顶；录屏时请选择单个窗口或标签页"
+          : "提词器已打开；录屏时请选择单个窗口或标签页",
+      );
+    } catch {
+      setErrorMessage("悬浮提词器没有打开，请允许浏览器弹出窗口。");
+    }
+  };
+
   useEffect(() => {
     pipPositionRef.current = pipPosition;
   }, [pipPosition]);
+
+  useEffect(() => {
+    setMp4Ready(
+      typeof MediaRecorder !== "undefined" && Boolean(chooseMp4MimeType()),
+    );
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const handle = await restoreDirectoryHandle();
+        if (!handle) return;
+        directoryHandleRef.current = handle;
+        setDirectoryName(handle.name);
+        const permissionHandle = handle as DirectoryHandleWithPermission;
+        const permission = permissionHandle.queryPermission
+          ? await permissionHandle.queryPermission({ mode: "readwrite" })
+          : "granted";
+        if (permission === "granted") {
+          await refreshRecordingLibrary(handle);
+        } else {
+          setDirectoryNeedsPermission(true);
+        }
+      } catch {
+        // IndexedDB or a previously selected folder may be unavailable.
+      }
+    })();
+  }, [refreshRecordingLibrary]);
+
+  useEffect(() => {
+    if (sidePanel !== "library") return;
+    void refreshRecordingLibrary();
+
+    const refreshOnFocus = () => {
+      void refreshRecordingLibrary();
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refreshRecordingLibrary();
+      }
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [refreshRecordingLibrary, sidePanel]);
 
   useEffect(() => {
     attachStream(cameraSourceRef.current, cameraStreamRef.current);
@@ -243,6 +624,8 @@ export default function Home() {
       }
       if (timerRef.current) clearInterval(timerRef.current);
       void audioContextRef.current?.close();
+      floatingPrompterWindowRef.current?.close();
+      libraryUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
 
@@ -340,17 +723,24 @@ export default function Home() {
       video: {
         frameRate: { ideal: 30, max: 30 },
         cursor: "always",
+        displaySurface: "window",
       },
       audio: true,
+      monitorTypeSurfaces: "exclude",
       systemAudio: "include",
       selfBrowserSurface: "exclude",
       surfaceSwitching: "include",
     } as DisplayMediaStreamOptions;
 
     const stream = await navigator.mediaDevices.getDisplayMedia(options);
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack?.getSettings().displaySurface === "monitor") {
+      stopStream(stream);
+      throw new Error("ENTIRE_SCREEN_SELECTED");
+    }
+
     screenStreamRef.current = stream;
     attachStream(screenSourceRef.current, stream);
-    const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack && "contentHint" in videoTrack) {
       videoTrack.contentHint = "detail";
     }
@@ -386,7 +776,16 @@ export default function Home() {
           : "屏幕已就绪；当前分享源没有系统声音",
       );
     } catch (error) {
-      setFriendlyError(error, "没有成功选择屏幕，请再试一次。");
+      if (
+        error instanceof Error &&
+        error.message === "ENTIRE_SCREEN_SELECTED"
+      ) {
+        setErrorMessage(
+          "为了不把提词器录进去，请选择单个窗口或标签页，不要选择整个屏幕。",
+        );
+      } else {
+        setFriendlyError(error, "没有成功选择屏幕，请再试一次。");
+      }
     }
   };
 
@@ -549,6 +948,13 @@ export default function Home() {
     });
 
     try {
+      const mimeType =
+        typeof MediaRecorder !== "undefined" ? chooseMp4MimeType() : "";
+      if (!mimeType) {
+        throw new Error("MP4_UNSUPPORTED");
+      }
+      await ensureRecordingDirectory();
+
       let cameraStream: MediaStream | null = cameraStreamRef.current;
       let screenStream: MediaStream | null = screenStreamRef.current;
       let microphoneStream: MediaStream | null =
@@ -575,16 +981,13 @@ export default function Home() {
       ];
       await addMixedAudio(outputStream, audioSources);
 
-      const mimeType = chooseMimeType();
       const recorder = new MediaRecorder(
         outputStream,
-        mimeType
-          ? {
-              mimeType,
-              videoBitsPerSecond: 8_000_000,
-              audioBitsPerSecond: 192_000,
-            }
-          : undefined,
+        {
+          mimeType,
+          videoBitsPerSecond: 8_000_000,
+          audioBitsPerSecond: 192_000,
+        },
       );
       mediaRecorderRef.current = recorder;
       recorderChunksRef.current = [];
@@ -595,7 +998,7 @@ export default function Home() {
 
       recorder.addEventListener(
         "stop",
-        () => {
+        async () => {
           setRecorderState("processing");
           if (animationFrameRef.current !== null) {
             cancelAnimationFrame(animationFrameRef.current);
@@ -609,23 +1012,41 @@ export default function Home() {
           void audioContextRef.current?.close();
           audioContextRef.current = null;
 
-          const finalMime = recorder.mimeType || mimeType || "video/webm";
-          const extension = finalMime.includes("mp4") ? "mp4" : "webm";
-          const blob = new Blob(recorderChunksRef.current, { type: finalMime });
+          const finalMime = recorder.mimeType || mimeType;
+          if (!finalMime.toLowerCase().includes("mp4")) {
+            setRecorderState("idle");
+            setErrorMessage(
+              "浏览器没有生成真正的 MP4 文件，请更新浏览器后再试。",
+            );
+            mediaRecorderRef.current = null;
+            return;
+          }
+
+          const blob = new Blob(recorderChunksRef.current, {
+            type: "video/mp4",
+          });
           const url = URL.createObjectURL(blob);
           const stamp = new Date()
             .toISOString()
             .replace(/:/g, "-")
             .replace(/\.\d{3}Z$/, "");
-          const name = `镜场-${stamp}.${extension}`;
-          const link = document.createElement("a");
-          link.href = url;
-          link.download = name;
-          link.click();
+          const name = `镜场-${stamp}.mp4`;
           setLastRecording({ url, name, size: blob.size });
-          setRecorderState("idle");
-          setStatusMessage("录制完成，文件已保存到下载目录");
-          mediaRecorderRef.current = null;
+          try {
+            await saveRecordingToDirectory(blob, name);
+            await refreshRecordingLibrary();
+            setSidePanel("library");
+            setStatusMessage(
+              `MP4 已保存到「${directoryHandleRef.current?.name || "录制文件夹"}」`,
+            );
+          } catch {
+            setErrorMessage(
+              "MP4 已生成，但没有写入保存文件夹。请点击右侧下载副本。",
+            );
+          } finally {
+            setRecorderState("idle");
+            mediaRecorderRef.current = null;
+          }
         },
         { once: true },
       );
@@ -645,7 +1066,34 @@ export default function Home() {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
-      setFriendlyError(error, "录制没有启动，请检查设备和浏览器权限。");
+      if (error instanceof Error && error.message === "MP4_UNSUPPORTED") {
+        setErrorMessage(
+          "当前浏览器不能直接生成 MP4。请更新 Chrome，或改用最新版 Safari。",
+        );
+      } else if (
+        error instanceof Error &&
+        error.message === "FOLDER_UNSUPPORTED"
+      ) {
+        setErrorMessage(
+          "当前浏览器不能直接保存到文件夹。请使用最新版 Chrome 或 Edge。",
+        );
+      } else if (
+        error instanceof Error &&
+        error.message === "ENTIRE_SCREEN_SELECTED"
+      ) {
+        setErrorMessage(
+          "为了不把提词器录进去，请重新选择单个窗口或标签页。",
+        );
+      } else if (
+        typeof error === "object" &&
+        error &&
+        "name" in error &&
+        String((error as { name: unknown }).name) === "AbortError"
+      ) {
+        setStatusMessage("未选择保存文件夹，录制没有开始");
+      } else {
+        setFriendlyError(error, "录制没有启动，请检查设备和浏览器权限。");
+      }
     }
   };
 
@@ -760,7 +1208,7 @@ export default function Home() {
               <span className={screenActive || cameraActive ? "ready" : ""}>
                 {screenActive || cameraActive ? "信号就绪" : "等待信号"}
               </span>
-              <span>1920 × 1080 · 30 FPS</span>
+              <span>MP4 · 1920 × 1080 · 30 FPS</span>
             </div>
 
             <div className="preview-stage" ref={previewRef}>
@@ -774,7 +1222,7 @@ export default function Home() {
                     <i />
                   </div>
                   <strong>选择你要演示的屏幕</strong>
-                  <p>浏览器会让你决定分享整个屏幕、窗口或标签页</p>
+                  <p>请选择单个窗口或标签页，悬浮提词器不会进入成片</p>
                 </div>
               )}
 
@@ -875,6 +1323,12 @@ export default function Home() {
               <span className={screenActive ? "ready" : ""}>
                 <i /> 屏幕
               </span>
+              <span className={mp4Ready ? "ready" : "unsupported"}>
+                <i /> {mp4Ready === null ? "检测格式" : mp4Ready ? "MP4" : "MP4 不可用"}
+              </span>
+              <span className={directoryName ? "ready" : ""}>
+                <i /> {directoryName || "未选文件夹"}
+              </span>
             </div>
 
             <div className="primary-controls">
@@ -941,92 +1395,235 @@ export default function Home() {
           <div className="status-line" aria-live="polite">
             <span>{errorMessage || statusMessage}</span>
             {lastRecording && (
-              <a href={lastRecording.url} download={lastRecording.name}>
-                再次下载 · {formatBytes(lastRecording.size)}
-              </a>
+              <div className="status-actions">
+                <button type="button" onClick={() => setSidePanel("library")}>
+                  查看录制库
+                </button>
+                <a href={lastRecording.url} download={lastRecording.name}>
+                  下载副本 · {formatBytes(lastRecording.size)}
+                </a>
+              </div>
             )}
           </div>
         </section>
 
-        <aside className="teleprompter" aria-label="提词器">
+        <aside
+          className={`teleprompter ${sidePanel === "library" ? "library-mode" : ""}`}
+          aria-label={sidePanel === "script" ? "提词器" : "录制库"}
+        >
           <div className="teleprompter-heading">
-            <div>
-              <p className="eyebrow">SCRIPT / 台词</p>
-              <h2>提词器</h2>
+            <div className="side-panel-tabs" aria-label="右侧面板">
+              <button
+                type="button"
+                className={sidePanel === "script" ? "active" : ""}
+                onClick={() => setSidePanel("script")}
+                aria-pressed={sidePanel === "script"}
+              >
+                <small>SCRIPT</small>
+                提词器
+              </button>
+              <button
+                type="button"
+                className={sidePanel === "library" ? "active" : ""}
+                onClick={() => setSidePanel("library")}
+                aria-pressed={sidePanel === "library"}
+              >
+                <small>LIBRARY</small>
+                录制库
+                {recordingLibrary.length > 0 && (
+                  <b>{recordingLibrary.length}</b>
+                )}
+              </button>
             </div>
-            <button
-              type="button"
-              className="reset-script"
-              onClick={() => {
-                if (scriptRef.current) scriptRef.current.scrollTop = 0;
-              }}
-            >
-              回到开头
-            </button>
+            {sidePanel === "script" ? (
+              <button
+                type="button"
+                className="reset-script"
+                onClick={() => {
+                  if (scriptRef.current) scriptRef.current.scrollTop = 0;
+                }}
+              >
+                回到开头
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="reset-script"
+                onClick={() => void refreshRecordingLibrary()}
+                disabled={libraryLoading || !directoryName}
+              >
+                {libraryLoading ? "读取中" : "刷新"}
+              </button>
+            )}
           </div>
 
-          <div className="script-window">
-            <div className="reading-line" aria-hidden="true">
-              <span>阅读线</span>
-            </div>
-            <textarea
-              ref={scriptRef}
-              className="script-text"
-              defaultValue={DEFAULT_SCRIPT}
-              style={{ fontSize: `${fontSize}px` }}
-              aria-label="可编辑的提词脚本"
-              spellCheck={false}
-              disabled={isRecording}
-            />
-          </div>
+          {sidePanel === "script" ? (
+            <>
+              <div className="script-window">
+                <div className="reading-line" aria-hidden="true">
+                  <span>阅读线</span>
+                </div>
+                <textarea
+                  ref={scriptRef}
+                  className="script-text"
+                  defaultValue={DEFAULT_SCRIPT}
+                  style={{ fontSize: `${fontSize}px` }}
+                  aria-label="可编辑的提词脚本"
+                  spellCheck={false}
+                  disabled={isRecording}
+                />
+              </div>
 
-          <div className="teleprompter-controls">
-            <div className="control-row">
-              <label htmlFor="font-size">字号</label>
-              <input
-                id="font-size"
-                type="range"
-                min="18"
-                max="36"
-                step="1"
-                value={fontSize}
-                onChange={(event) => setFontSize(Number(event.target.value))}
-              />
-              <output>{fontSize}</output>
-            </div>
-            <div className="control-row">
-              <label htmlFor="scroll-speed">速度</label>
-              <input
-                id="scroll-speed"
-                type="range"
-                min="1"
-                max="5"
-                step="1"
-                value={scrollSpeed}
-                onChange={(event) => setScrollSpeed(Number(event.target.value))}
-              />
-              <output>{scrollSpeed}×</output>
-            </div>
-            <button
-              className={`autoscroll-button ${autoScroll ? "active" : ""}`}
-              type="button"
-              onClick={() => setAutoScroll((value) => !value)}
-              aria-pressed={autoScroll}
-            >
-              <span className="toggle-track" aria-hidden="true">
-                <i />
-              </span>
-              <span>
-                <small>AUTO SCROLL</small>
-                {autoScroll ? "暂停自动滚动" : "开启自动滚动"}
-              </span>
-            </button>
-          </div>
+              <div className="teleprompter-controls">
+                <div className="control-row">
+                  <label htmlFor="font-size">字号</label>
+                  <input
+                    id="font-size"
+                    type="range"
+                    min="18"
+                    max="36"
+                    step="1"
+                    value={fontSize}
+                    onChange={(event) => setFontSize(Number(event.target.value))}
+                  />
+                  <output>{fontSize}</output>
+                </div>
+                <div className="control-row">
+                  <label htmlFor="scroll-speed">速度</label>
+                  <input
+                    id="scroll-speed"
+                    type="range"
+                    min="1"
+                    max="5"
+                    step="1"
+                    value={scrollSpeed}
+                    onChange={(event) => setScrollSpeed(Number(event.target.value))}
+                  />
+                  <output>{scrollSpeed}×</output>
+                </div>
+                <button
+                  className={`autoscroll-button ${autoScroll ? "active" : ""}`}
+                  type="button"
+                  onClick={() => setAutoScroll((value) => !value)}
+                  aria-pressed={autoScroll}
+                >
+                  <span className="toggle-track" aria-hidden="true">
+                    <i />
+                  </span>
+                  <span>
+                    <small>AUTO SCROLL</small>
+                    {autoScroll ? "暂停自动滚动" : "开启自动滚动"}
+                  </span>
+                </button>
+                <button
+                  className="floating-prompter-button"
+                  type="button"
+                  onClick={() => void openFloatingPrompter()}
+                >
+                  <span aria-hidden="true">↗</span>
+                  <span>
+                    <small>ALWAYS ON TOP</small>
+                    悬浮提词器
+                  </span>
+                </button>
+              </div>
 
-          <footer className="teleprompter-footer">
-            <span>脚本可直接编辑与粘贴</span>
-            <span>{isRecording ? "录制中已锁定" : "录制时自动锁定"}</span>
-          </footer>
+              <footer className="teleprompter-footer">
+                <span>脚本可直接编辑与粘贴</span>
+                <span>{isRecording ? "录制中已锁定" : "录制时自动锁定"}</span>
+              </footer>
+            </>
+          ) : (
+            <>
+              <div className="recording-library">
+                <section className="folder-card">
+                  <p className="eyebrow">LOCAL FOLDER / 本机目录</p>
+                  <strong>
+                    {directoryName || "为录制内容选择一个保存文件夹"}
+                  </strong>
+                  <p>
+                    {directoryName
+                      ? directoryNeedsPermission
+                        ? "浏览器需要你重新授权这个文件夹。"
+                        : "这里是唯一来源：移出或删除文件后，录制库也会同步消失。"
+                      : "以后每条 MP4 都会直接写进这里，不经过云端。"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const directoryAction = directoryNeedsPermission
+                        ? ensureRecordingDirectory()
+                        : chooseRecordingDirectory();
+                      void directoryAction.catch((error) => {
+                        if (
+                          typeof error === "object" &&
+                          error &&
+                          "name" in error &&
+                          String((error as { name: unknown }).name) ===
+                            "AbortError"
+                        ) {
+                          return;
+                        }
+                        setErrorMessage(
+                          "保存文件夹没有打开，请使用最新版 Chrome 或 Edge。",
+                        );
+                      });
+                    }}
+                  >
+                    {directoryNeedsPermission
+                      ? "重新授权文件夹"
+                      : directoryName
+                        ? "更换保存文件夹"
+                        : "选择保存文件夹"}
+                  </button>
+                </section>
+
+                {directoryName && !directoryNeedsPermission && (
+                  <div className="library-list">
+                    <div className="library-list-heading">
+                      <span>
+                        {libraryLoading
+                          ? "正在读取文件…"
+                          : `${recordingLibrary.length} 条本机录制`}
+                      </span>
+                      <small>MP4 ONLY</small>
+                    </div>
+
+                    {!libraryLoading && recordingLibrary.length === 0 && (
+                      <div className="empty-library">
+                        <span>00</span>
+                        <strong>还没有录制内容</strong>
+                        <p>完成第一条录制后，视频会出现在这里。</p>
+                      </div>
+                    )}
+
+                    {recordingLibrary.map((item) => (
+                      <article className="recording-card" key={item.name}>
+                        <video
+                          src={item.url}
+                          controls
+                          preload="metadata"
+                          playsInline
+                        />
+                        <div>
+                          <strong title={item.name}>{item.name}</strong>
+                          <span>
+                            {formatFileDate(item.lastModified)} ·{" "}
+                            {formatBytes(item.size)}
+                          </span>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <footer className="teleprompter-footer">
+                <span>以文件夹真实内容为准</span>
+                <span>删除或移出后刷新即消失</span>
+              </footer>
+            </>
+          )}
         </aside>
       </section>
 
