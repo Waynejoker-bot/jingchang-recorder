@@ -243,6 +243,7 @@ export default function Home() {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState("准备好后，先开启摄像头");
   const [errorMessage, setErrorMessage] = useState("");
+  const [outputResolution, setOutputResolution] = useState("原生分辨率优先");
   const [fontSize, setFontSize] = useState(24);
   const [scrollSpeed, setScrollSpeed] = useState(2);
   const [autoScroll, setAutoScroll] = useState(false);
@@ -722,6 +723,9 @@ export default function Home() {
     const options = {
       video: {
         frameRate: { ideal: 30, max: 30 },
+        width: { ideal: 3840, max: 3840 },
+        height: { ideal: 2160, max: 2160 },
+        resizeMode: "none",
         cursor: "always",
         displaySurface: "window",
       },
@@ -835,14 +839,34 @@ export default function Home() {
     }
   };
 
+  const getRecordingDimensions = (captureMode: CaptureMode) => {
+    if (captureMode === "camera") {
+      return { width: 1920, height: 1080 };
+    }
+
+    const screen = screenSourceRef.current;
+    const screenTrack = screenStreamRef.current?.getVideoTracks()[0];
+    const settings = screenTrack?.getSettings();
+    const sourceWidth = screen?.videoWidth || settings?.width || 1920;
+    const sourceHeight = screen?.videoHeight || settings?.height || 1080;
+    const scale = Math.min(1, 3840 / sourceWidth, 2160 / sourceHeight);
+
+    return {
+      width: Math.max(2, Math.floor((sourceWidth * scale) / 2) * 2),
+      height: Math.max(2, Math.floor((sourceHeight * scale) / 2) * 2),
+    };
+  };
+
   const beginCanvasComposition = (captureMode: CaptureMode) => {
     const canvas = recordingCanvasRef.current;
     const camera = cameraSourceRef.current;
     const screen = screenSourceRef.current;
     if (!canvas) throw new Error("录制画布不可用");
 
-    canvas.width = 1920;
-    canvas.height = 1080;
+    const dimensions = getRecordingDimensions(captureMode);
+    canvas.width = dimensions.width;
+    canvas.height = dimensions.height;
+    setOutputResolution(`${dimensions.width} × ${dimensions.height}`);
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) throw new Error("无法创建录制画面");
 
@@ -891,7 +915,11 @@ export default function Home() {
     };
 
     draw();
-    return canvas.captureStream(30);
+    return {
+      stream: canvas.captureStream(30),
+      width: dimensions.width,
+      height: dimensions.height,
+    };
   };
 
   const addMixedAudio = async (
@@ -974,7 +1002,8 @@ export default function Home() {
       }
 
       await runCountdown();
-      const outputStream = beginCanvasComposition(mode);
+      const composition = beginCanvasComposition(mode);
+      const outputStream = composition.stream;
       const audioSources = [
         ...(microphoneEnabled && microphoneStream ? [microphoneStream] : []),
         ...(screenStream ? [screenStream] : []),
@@ -985,7 +1014,19 @@ export default function Home() {
         outputStream,
         {
           mimeType,
-          videoBitsPerSecond: 8_000_000,
+          videoBitsPerSecond:
+            mode === "camera"
+              ? 12_000_000
+              : Math.min(
+                  32_000_000,
+                  Math.max(
+                    16_000_000,
+                    Math.round(
+                      (composition.width * composition.height * 30 * 0.24) /
+                        1_000_000,
+                    ) * 1_000_000,
+                  ),
+                ),
           audioBitsPerSecond: 192_000,
         },
       );
@@ -1208,7 +1249,7 @@ export default function Home() {
               <span className={screenActive || cameraActive ? "ready" : ""}>
                 {screenActive || cameraActive ? "信号就绪" : "等待信号"}
               </span>
-              <span>MP4 · 1920 × 1080 · 30 FPS</span>
+              <span>MP4 · {outputResolution} · 30 FPS</span>
             </div>
 
             <div className="preview-stage" ref={previewRef}>
