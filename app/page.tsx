@@ -18,6 +18,20 @@ type PipPosition = {
   width: number;
 };
 
+type CropRegion = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type PreviewBounds = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
 type DirectoryHandleWithPermission = FileSystemDirectoryHandle & {
   entries: () => AsyncIterableIterator<[string, FileSystemHandle]>;
   queryPermission?: (options: {
@@ -55,6 +69,7 @@ type RecordingLibraryItem = {
 const DIRECTORY_DB = "jingchang-local-library";
 const DIRECTORY_STORE = "handles";
 const DIRECTORY_KEY = "recordings-directory";
+const FULL_CROP: CropRegion = { x: 0, y: 0, width: 1, height: 1 };
 
 const DEFAULT_SCRIPT = `今天我想分享一个，我最近在做产品时非常真实的判断。
 
@@ -221,14 +236,29 @@ const drawContain = (
   video: HTMLVideoElement,
   width: number,
   height: number,
+  crop: CropRegion = FULL_CROP,
 ) => {
   if (!video.videoWidth || !video.videoHeight) return;
-  const scale = Math.min(width / video.videoWidth, height / video.videoHeight);
-  const drawWidth = video.videoWidth * scale;
-  const drawHeight = video.videoHeight * scale;
+  const sourceX = video.videoWidth * crop.x;
+  const sourceY = video.videoHeight * crop.y;
+  const sourceWidth = video.videoWidth * crop.width;
+  const sourceHeight = video.videoHeight * crop.height;
+  const scale = Math.min(width / sourceWidth, height / sourceHeight);
+  const drawWidth = sourceWidth * scale;
+  const drawHeight = sourceHeight * scale;
   const x = (width - drawWidth) / 2;
   const y = (height - drawHeight) / 2;
-  context.drawImage(video, x, y, drawWidth, drawHeight);
+  context.drawImage(
+    video,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    x,
+    y,
+    drawWidth,
+    drawHeight,
+  );
 };
 
 export default function Home() {
@@ -259,6 +289,14 @@ export default function Home() {
     x: 0.035,
     y: 0.69,
     width: 0.25,
+  });
+  const [cropRegion, setCropRegion] = useState<CropRegion>(FULL_CROP);
+  const [cropSelecting, setCropSelecting] = useState(false);
+  const [screenPreviewBounds, setScreenPreviewBounds] = useState<PreviewBounds>({
+    left: 0,
+    top: 0,
+    width: 0,
+    height: 0,
   });
   const [lastRecording, setLastRecording] = useState<{
     url: string;
@@ -292,6 +330,12 @@ export default function Home() {
   const floatingPrompterWindowRef = useRef<Window | null>(null);
   const libraryUrlsRef = useRef<string[]>([]);
   const pipPositionRef = useRef(pipPosition);
+  const cropRegionRef = useRef<CropRegion>(cropRegion);
+  const cropDragRef = useRef<{
+    startX: number;
+    startY: number;
+    pointerId: number;
+  } | null>(null);
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -302,6 +346,44 @@ export default function Home() {
 
   const isBusy = recorderState !== "idle";
   const isRecording = recorderState === "recording";
+  const hasCrop =
+    cropRegion.x > 0.001 ||
+    cropRegion.y > 0.001 ||
+    cropRegion.width < 0.999 ||
+    cropRegion.height < 0.999;
+
+  const updateCropRegion = (nextRegion: CropRegion) => {
+    cropRegionRef.current = nextRegion;
+    setCropRegion(nextRegion);
+  };
+
+  const updateScreenPreviewBounds = useCallback(() => {
+    const preview = previewRef.current;
+    const video = screenPreviewRef.current;
+    if (!preview || !video) return;
+
+    const containerWidth = preview.clientWidth;
+    const containerHeight = preview.clientHeight;
+    const settings = screenStreamRef.current?.getVideoTracks()[0]?.getSettings();
+    const sourceWidth = video.videoWidth || settings?.width || containerWidth;
+    const sourceHeight = video.videoHeight || settings?.height || containerHeight;
+    if (!containerWidth || !containerHeight || !sourceWidth || !sourceHeight) {
+      return;
+    }
+
+    const scale = Math.min(
+      containerWidth / sourceWidth,
+      containerHeight / sourceHeight,
+    );
+    const width = sourceWidth * scale;
+    const height = sourceHeight * scale;
+    setScreenPreviewBounds({
+      left: (containerWidth - width) / 2,
+      top: (containerHeight - height) / 2,
+      width,
+      height,
+    });
+  }, []);
 
   const refreshRecordingLibrary = useCallback(
     async (handle = directoryHandleRef.current) => {
@@ -542,6 +624,27 @@ export default function Home() {
   }, [pipPosition]);
 
   useEffect(() => {
+    cropRegionRef.current = cropRegion;
+  }, [cropRegion]);
+
+  useEffect(() => {
+    updateScreenPreviewBounds();
+    const preview = previewRef.current;
+    const video = screenPreviewRef.current;
+    if (!preview) return;
+
+    const observer = new ResizeObserver(updateScreenPreviewBounds);
+    observer.observe(preview);
+    video?.addEventListener("loadedmetadata", updateScreenPreviewBounds);
+    video?.addEventListener("resize", updateScreenPreviewBounds);
+    return () => {
+      observer.disconnect();
+      video?.removeEventListener("loadedmetadata", updateScreenPreviewBounds);
+      video?.removeEventListener("resize", updateScreenPreviewBounds);
+    };
+  }, [mode, screenActive, updateScreenPreviewBounds]);
+
+  useEffect(() => {
     setMp4Ready(
       typeof MediaRecorder !== "undefined" && Boolean(chooseMp4MimeType()),
     );
@@ -752,6 +855,8 @@ export default function Home() {
 
     screenStreamRef.current = stream;
     attachStream(screenSourceRef.current, stream);
+    updateCropRegion(FULL_CROP);
+    setCropSelecting(false);
     if (videoTrack && "contentHint" in videoTrack) {
       videoTrack.contentHint = "detail";
     }
@@ -854,8 +959,11 @@ export default function Home() {
     const screen = screenSourceRef.current;
     const screenTrack = screenStreamRef.current?.getVideoTracks()[0];
     const settings = screenTrack?.getSettings();
-    const sourceWidth = screen?.videoWidth || settings?.width || 1920;
-    const sourceHeight = screen?.videoHeight || settings?.height || 1080;
+    const crop = cropRegionRef.current;
+    const sourceWidth =
+      (screen?.videoWidth || settings?.width || 1920) * crop.width;
+    const sourceHeight =
+      (screen?.videoHeight || settings?.height || 1080) * crop.height;
     const scale = Math.min(1, 3840 / sourceWidth, 2160 / sourceHeight);
 
     return {
@@ -885,7 +993,13 @@ export default function Home() {
       if (activeMode === "camera" && camera) {
         drawCover(context, camera, 0, 0, canvas.width, canvas.height);
       } else if (screen) {
-        drawContain(context, screen, canvas.width, canvas.height);
+        drawContain(
+          context,
+          screen,
+          canvas.width,
+          canvas.height,
+          cropRegionRef.current,
+        );
       }
 
       if (activeMode === "composite" && camera && cameraEnabled) {
@@ -1247,6 +1361,78 @@ export default function Home() {
     }
   };
 
+  const startCropSelection = () => {
+    if (!screenStreamRef.current?.active) {
+      setErrorMessage("请先选择要录制的窗口或标签页。");
+      return;
+    }
+    setErrorMessage("");
+    setCropSelecting(true);
+    setStatusMessage("在预览画面上按住拖动，框出要进入成片的区域");
+  };
+
+  const startCropDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!cropSelecting) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const startX = Math.max(
+      0,
+      Math.min(1, (event.clientX - bounds.left) / bounds.width),
+    );
+    const startY = Math.max(
+      0,
+      Math.min(1, (event.clientY - bounds.top) / bounds.height),
+    );
+    cropDragRef.current = { startX, startY, pointerId: event.pointerId };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    updateCropRegion({ x: startX, y: startY, width: 0.001, height: 0.001 });
+  };
+
+  const moveCropDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    if (!cropSelecting || !drag || drag.pointerId !== event.pointerId) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const currentX = Math.max(
+      0,
+      Math.min(1, (event.clientX - bounds.left) / bounds.width),
+    );
+    const currentY = Math.max(
+      0,
+      Math.min(1, (event.clientY - bounds.top) / bounds.height),
+    );
+    updateCropRegion({
+      x: Math.min(drag.startX, currentX),
+      y: Math.min(drag.startY, currentY),
+      width: Math.max(0.001, Math.abs(currentX - drag.startX)),
+      height: Math.max(0.001, Math.abs(currentY - drag.startY)),
+    });
+  };
+
+  const endCropDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    cropDragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    if (cropRegionRef.current.width < 0.03 || cropRegionRef.current.height < 0.03) {
+      updateCropRegion(FULL_CROP);
+      setErrorMessage("裁剪区域太小，请重新拖动框选。");
+      return;
+    }
+    setCropSelecting(false);
+    setStatusMessage(
+      isRecording ? "裁剪区域已实时应用到当前录制" : "裁剪区域已锁定，只会录制框内画面",
+    );
+  };
+
+  const resetCrop = () => {
+    cropDragRef.current = null;
+    setCropSelecting(false);
+    updateCropRegion(FULL_CROP);
+    setErrorMessage("");
+    setStatusMessage(
+      isRecording ? "已恢复录制完整窗口" : "已恢复完整窗口画面",
+    );
+  };
+
   const startPipDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (isBusy || !previewRef.current) return;
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1263,11 +1449,19 @@ export default function Home() {
     const drag = dragRef.current;
     const preview = previewRef.current;
     if (!drag || !preview || drag.pointerId !== event.pointerId) return;
-    const bounds = preview.getBoundingClientRect();
+    const previewBounds = preview.getBoundingClientRect();
+    const activeWidth =
+      hasCrop && mode !== "camera"
+        ? Math.max(1, screenPreviewBounds.width * cropRegion.width)
+        : previewBounds.width;
+    const activeHeight =
+      hasCrop && mode !== "camera"
+        ? Math.max(1, screenPreviewBounds.height * cropRegion.height)
+        : previewBounds.height;
     const nextX =
-      drag.originX + (event.clientX - drag.startX) / bounds.width;
+      drag.originX + (event.clientX - drag.startX) / activeWidth;
     const nextY =
-      drag.originY + (event.clientY - drag.startY) / bounds.height;
+      drag.originY + (event.clientY - drag.startY) / activeHeight;
     setPipPosition((current) => ({
       ...current,
       x: Math.max(0.015, Math.min(0.985 - current.width, nextX)),
@@ -1284,6 +1478,34 @@ export default function Home() {
   const showScreen = mode !== "camera";
   const showCameraMain = mode === "camera";
   const showCameraPip = !showCameraMain && cameraActive && cameraEnabled;
+  const activeScreenBounds: PreviewBounds = hasCrop
+    ? {
+        left: screenPreviewBounds.left + cropRegion.x * screenPreviewBounds.width,
+        top: screenPreviewBounds.top + cropRegion.y * screenPreviewBounds.height,
+        width: cropRegion.width * screenPreviewBounds.width,
+        height: cropRegion.height * screenPreviewBounds.height,
+      }
+    : screenPreviewBounds;
+  const pipPreviewWidth = activeScreenBounds.width * pipPosition.width;
+  const pipPreviewHeight = pipPreviewWidth * (9 / 16);
+  const pipPreviewStyle =
+    hasCrop && showScreen
+      ? {
+          left: `${activeScreenBounds.left + activeScreenBounds.width * pipPosition.x}px`,
+          top: `${Math.max(
+            activeScreenBounds.top + 2,
+            Math.min(
+              activeScreenBounds.top + activeScreenBounds.height - pipPreviewHeight - 2,
+              activeScreenBounds.top + activeScreenBounds.height * pipPosition.y,
+            ),
+          )}px`,
+          width: `${pipPreviewWidth}px`,
+        }
+      : {
+          left: `${pipPosition.x * 100}%`,
+          top: `${pipPosition.y * 100}%`,
+          width: `${pipPosition.width * 100}%`,
+        };
 
   return (
     <main className="studio-shell">
@@ -1371,6 +1593,7 @@ export default function Home() {
                   autoPlay
                   muted
                   playsInline
+                  onLoadedMetadata={updateScreenPreviewBounds}
                 />
               )}
 
@@ -1386,16 +1609,76 @@ export default function Home() {
                 />
               )}
 
+              {showScreen && screenActive && (
+                <div className="crop-toolbar">
+                  <div>
+                    <small>CROP / 录制范围</small>
+                    <span>
+                      {cropSelecting
+                        ? "拖动框选画面"
+                        : hasCrop
+                          ? "仅录框内"
+                          : "完整窗口"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className={cropSelecting ? "active" : ""}
+                    onClick={startCropSelection}
+                  >
+                    {hasCrop ? "重新框选" : "裁剪画面"}
+                  </button>
+                  {hasCrop && (
+                    <button type="button" onClick={resetCrop}>
+                      恢复完整
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {showScreen &&
+                screenActive &&
+                (cropSelecting || hasCrop) && (
+                  <div
+                    className={`crop-selection-overlay ${
+                      cropSelecting ? "is-selecting" : "is-locked"
+                    }`}
+                    style={{
+                      left: `${screenPreviewBounds.left}px`,
+                      top: `${screenPreviewBounds.top}px`,
+                      width: `${screenPreviewBounds.width}px`,
+                      height: `${screenPreviewBounds.height}px`,
+                    }}
+                    onPointerDown={startCropDrag}
+                    onPointerMove={moveCropDrag}
+                    onPointerUp={endCropDrag}
+                    onPointerCancel={endCropDrag}
+                    aria-label="录制区域裁剪层"
+                  >
+                    <div
+                      className="crop-region"
+                      style={{
+                        left: `${cropRegion.x * 100}%`,
+                        top: `${cropRegion.y * 100}%`,
+                        width: `${cropRegion.width * 100}%`,
+                        height: `${cropRegion.height * 100}%`,
+                      }}
+                    >
+                      <span>{cropSelecting ? "松开完成框选" : "成片范围"}</span>
+                      <i />
+                      <i />
+                      <i />
+                      <i />
+                    </div>
+                  </div>
+                )}
+
               {showCameraPip && (
                 <div
                   className={`camera-pip ${
                     mode === "screen" ? "monitor-only" : ""
                   }`}
-                  style={{
-                    left: `${pipPosition.x * 100}%`,
-                    top: `${pipPosition.y * 100}%`,
-                    width: `${pipPosition.width * 100}%`,
-                  }}
+                  style={pipPreviewStyle}
                   onPointerDown={startPipDrag}
                   onPointerMove={movePip}
                   onPointerUp={endPipDrag}
@@ -1415,7 +1698,21 @@ export default function Home() {
                 </div>
               )}
 
-              <div className="safe-area" aria-hidden="true">
+              <div
+                className="safe-area"
+                style={
+                  hasCrop && showScreen
+                    ? {
+                        inset: "auto",
+                        left: `${activeScreenBounds.left + activeScreenBounds.width * 0.05}px`,
+                        top: `${activeScreenBounds.top + activeScreenBounds.height * 0.05}px`,
+                        width: `${activeScreenBounds.width * 0.9}px`,
+                        height: `${activeScreenBounds.height * 0.9}px`,
+                      }
+                    : undefined
+                }
+                aria-hidden="true"
+              >
                 <i />
                 <i />
                 <i />

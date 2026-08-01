@@ -364,6 +364,129 @@ input:focus-visible {
   opacity: 1;
 }
 
+.crop-toolbar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 18;
+  display: flex;
+  align-items: stretch;
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid rgba(240, 76, 63, 0.42);
+  background: rgba(9, 10, 11, 0.9);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(10px);
+}
+
+.crop-toolbar > div {
+  display: grid;
+  min-width: 112px;
+  align-content: center;
+  gap: 2px;
+  padding: 2px 8px;
+}
+
+.crop-toolbar small {
+  color: var(--record);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.13em;
+}
+
+.crop-toolbar span {
+  color: #d8d5cf;
+  font-size: 10px;
+}
+
+.crop-toolbar button {
+  min-width: 70px;
+  border: 1px solid #373b3e;
+  background: #1a1d1f;
+  color: #c9c7c1;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.crop-toolbar button:hover,
+.crop-toolbar button.active {
+  border-color: var(--record);
+  background: rgba(240, 76, 63, 0.15);
+  color: #fff;
+}
+
+.crop-selection-overlay {
+  position: absolute;
+  z-index: 14;
+  overflow: hidden;
+  touch-action: none;
+}
+
+.crop-selection-overlay.is-selecting {
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+.crop-selection-overlay.is-locked {
+  pointer-events: none;
+}
+
+.crop-region {
+  position: absolute;
+  border: 3px solid var(--record);
+  background: rgba(240, 76, 63, 0.025);
+  box-shadow:
+    0 0 0 9999px rgba(3, 4, 5, 0.62),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.46);
+}
+
+.crop-region > span {
+  position: absolute;
+  top: 8px;
+  left: 9px;
+  padding: 5px 7px;
+  background: var(--record);
+  color: white;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.crop-region i {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  border-color: #fff;
+  border-style: solid;
+}
+
+.crop-region i:nth-of-type(1) {
+  top: -5px;
+  left: -5px;
+  border-width: 2px 0 0 2px;
+}
+
+.crop-region i:nth-of-type(2) {
+  top: -5px;
+  right: -5px;
+  border-width: 2px 2px 0 0;
+}
+
+.crop-region i:nth-of-type(3) {
+  right: -5px;
+  bottom: -5px;
+  border-width: 0 2px 2px 0;
+}
+
+.crop-region i:nth-of-type(4) {
+  bottom: -5px;
+  left: -5px;
+  border-width: 0 0 2px 2px;
+}
+
 .empty-preview {
   position: absolute;
   inset: 0;
