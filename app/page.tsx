@@ -1538,12 +1538,14 @@ export default function Home() {
               <p className="eyebrow">OUTPUT / 最终成片</p>
               <h1>一边操作，一边把话讲完整。</h1>
             </div>
-            {showScreen && screenActive && (
+            {showScreen && (
               <div className="crop-toolbar">
                 <div>
                   <small>CROP / 录制范围</small>
                   <span>
-                    {cropSelecting
+                    {!screenActive
+                      ? "选择屏幕后可用"
+                      : cropSelecting
                       ? "拖动框选画面"
                       : hasCrop
                         ? "仅录框内"
@@ -1554,10 +1556,11 @@ export default function Home() {
                   type="button"
                   className={cropSelecting ? "active" : ""}
                   onClick={startCropSelection}
+                  disabled={!screenActive}
                 >
                   {hasCrop ? "重新框选" : "裁剪画面"}
                 </button>
-                {hasCrop && (
+                {screenActive && hasCrop && (
                   <button type="button" onClick={resetCrop}>
                     恢复完整
                   </button>

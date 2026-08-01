@@ -413,6 +413,11 @@ input:focus-visible {
   color: #fff;
 }
 
+.crop-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .crop-selection-overlay {
   position: absolute;
   z-index: 14;
