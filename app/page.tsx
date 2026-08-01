@@ -1538,6 +1538,32 @@ export default function Home() {
               <p className="eyebrow">OUTPUT / 最终成片</p>
               <h1>一边操作，一边把话讲完整。</h1>
             </div>
+            {showScreen && screenActive && (
+              <div className="crop-toolbar">
+                <div>
+                  <small>CROP / 录制范围</small>
+                  <span>
+                    {cropSelecting
+                      ? "拖动框选画面"
+                      : hasCrop
+                        ? "仅录框内"
+                        : "完整窗口"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className={cropSelecting ? "active" : ""}
+                  onClick={startCropSelection}
+                >
+                  {hasCrop ? "重新框选" : "裁剪画面"}
+                </button>
+                {hasCrop && (
+                  <button type="button" onClick={resetCrop}>
+                    恢复完整
+                  </button>
+                )}
+              </div>
+            )}
             <div className="mode-tabs" aria-label="录制模式">
               {MODE_LABELS.map((item) => (
                 <button
@@ -1607,33 +1633,6 @@ export default function Home() {
                   muted
                   playsInline
                 />
-              )}
-
-              {showScreen && screenActive && (
-                <div className="crop-toolbar">
-                  <div>
-                    <small>CROP / 录制范围</small>
-                    <span>
-                      {cropSelecting
-                        ? "拖动框选画面"
-                        : hasCrop
-                          ? "仅录框内"
-                          : "完整窗口"}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className={cropSelecting ? "active" : ""}
-                    onClick={startCropSelection}
-                  >
-                    {hasCrop ? "重新框选" : "裁剪画面"}
-                  </button>
-                  {hasCrop && (
-                    <button type="button" onClick={resetCrop}>
-                      恢复完整
-                    </button>
-                  )}
-                </div>
               )}
 
               {showScreen &&
