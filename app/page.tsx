@@ -9,6 +9,7 @@ import {
 } from "react";
 
 type CaptureMode = "camera" | "screen" | "composite";
+type RecordingAspect = "16:9" | "4:3";
 type RecorderState = "idle" | "countdown" | "recording" | "processing";
 type SidePanel = "script" | "library";
 
@@ -59,6 +60,20 @@ type DocumentPictureInPictureWindow = Window & {
   };
 };
 
+type CaptureControllerLike = {
+  setFocusBehavior: (
+    behavior: "focus-captured-surface" | "no-focus-change",
+  ) => void;
+};
+
+type WindowWithCaptureController = Window & {
+  CaptureController?: new () => CaptureControllerLike;
+};
+
+type DisplayMediaOptionsWithController = DisplayMediaStreamOptions & {
+  controller?: CaptureControllerLike;
+};
+
 type RecordingLibraryItem = {
   name: string;
   size: number;
@@ -69,6 +84,7 @@ type RecordingLibraryItem = {
 const DIRECTORY_DB = "jingchang-local-library";
 const DIRECTORY_STORE = "handles";
 const DIRECTORY_KEY = "recordings-directory";
+const INTERRUPTED_RECORDING_KEY = "jingchang-interrupted-recording";
 const FULL_CROP: CropRegion = { x: 0, y: 0, width: 1, height: 1 };
 
 const DEFAULT_SCRIPT = `今天我想分享一个，我最近在做产品时非常真实的判断。
@@ -90,6 +106,29 @@ const MODE_LABELS: Array<{
   { id: "screen", label: "录屏", description: "镜头仅监看" },
   { id: "composite", label: "录屏 + 人像", description: "画中画成片" },
 ];
+
+const ASPECT_PRESETS: Array<{
+  id: RecordingAspect;
+  width: number;
+  height: number;
+  description: string;
+}> = [
+  {
+    id: "16:9",
+    width: 1920,
+    height: 1080,
+    description: "横屏视频、B 站和视频号常用",
+  },
+  {
+    id: "4:3",
+    width: 1440,
+    height: 1080,
+    description: "演示录屏和课程内容常用",
+  },
+];
+
+const getAspectPreset = (aspect: RecordingAspect) =>
+  ASPECT_PRESETS.find((preset) => preset.id === aspect) || ASPECT_PRESETS[0];
 
 const formatTime = (seconds: number) => {
   const hours = Math.floor(seconds / 3600);
@@ -263,21 +302,22 @@ const drawContain = (
 
 export default function Home() {
   const [mode, setMode] = useState<CaptureMode>("composite");
+  const [recordingAspect, setRecordingAspect] =
+    useState<RecordingAspect>("16:9");
   const [recorderState, setRecorderState] = useState<RecorderState>("idle");
   const [cameraActive, setCameraActive] = useState(false);
   const [screenActive, setScreenActive] = useState(false);
-  const [microphoneActive, setMicrophoneActive] = useState(false);
+  const [screenSelectionPending, setScreenSelectionPending] = useState(false);
   const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState("准备好后，先开启摄像头");
   const [errorMessage, setErrorMessage] = useState("");
-  const [outputResolution, setOutputResolution] = useState("原生分辨率优先");
+  const [outputResolution, setOutputResolution] = useState("1920 × 1080");
   const [fontSize, setFontSize] = useState(24);
   const [scrollSpeed, setScrollSpeed] = useState(2);
   const [autoScroll, setAutoScroll] = useState(false);
-  const [mp4Ready, setMp4Ready] = useState<boolean | null>(null);
   const [sidePanel, setSidePanel] = useState<SidePanel>("script");
   const [directoryName, setDirectoryName] = useState("");
   const [directoryNeedsPermission, setDirectoryNeedsPermission] = useState(false);
@@ -302,6 +342,7 @@ export default function Home() {
     url: string;
     name: string;
     size: number;
+    needsDownload: boolean;
   } | null>(null);
 
   const cameraStreamRef = useRef<MediaStream | null>(null);
@@ -315,6 +356,8 @@ export default function Home() {
   const previewRef = useRef<HTMLDivElement | null>(null);
   const scriptRef = useRef<HTMLTextAreaElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStartPendingRef = useRef(false);
+  const screenOpenPromiseRef = useRef<Promise<MediaStream> | null>(null);
   const recorderChunksRef = useRef<Blob[]>([]);
   const animationFrameRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -326,6 +369,7 @@ export default function Home() {
   const audioTrackIdsRef = useRef<Set<string>>(new Set());
   const recordingOutputStreamRef = useRef<MediaStream | null>(null);
   const modeRef = useRef<CaptureMode>(mode);
+  const cameraEnabledRef = useRef(cameraEnabled);
   const directoryHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const floatingPrompterWindowRef = useRef<Window | null>(null);
   const libraryUrlsRef = useRef<string[]>([]);
@@ -397,6 +441,9 @@ export default function Home() {
         ? await permissionHandle.queryPermission({ mode: "readwrite" })
         : "granted";
       if (permission !== "granted") {
+        libraryUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+        libraryUrlsRef.current = [];
+        setRecordingLibrary([]);
         setDirectoryNeedsPermission(true);
         return;
       }
@@ -624,8 +671,37 @@ export default function Home() {
   }, [pipPosition]);
 
   useEffect(() => {
+    cameraEnabledRef.current = cameraEnabled;
+  }, [cameraEnabled]);
+
+  useEffect(() => {
     cropRegionRef.current = cropRegion;
   }, [cropRegion]);
+
+  useEffect(() => {
+    try {
+      const interrupted = window.localStorage.getItem(INTERRUPTED_RECORDING_KEY);
+      if (interrupted) {
+        window.localStorage.removeItem(INTERRUPTED_RECORDING_KEY);
+        const noticeTimer = window.setTimeout(() => {
+          setErrorMessage("上次录制异常中断，没有生成可用文件，请重新录制。");
+        }, 0);
+        return () => window.clearTimeout(noticeTimer);
+      }
+    } catch {
+      // Recording still works when local storage is unavailable.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isBusy) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [isBusy]);
 
   useEffect(() => {
     updateScreenPreviewBounds();
@@ -643,12 +719,6 @@ export default function Home() {
       video?.removeEventListener("resize", updateScreenPreviewBounds);
     };
   }, [mode, screenActive, updateScreenPreviewBounds]);
-
-  useEffect(() => {
-    setMp4Ready(
-      typeof MediaRecorder !== "undefined" && Boolean(chooseMp4MimeType()),
-    );
-  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -697,7 +767,7 @@ export default function Home() {
     attachStream(cameraPreviewRef.current, cameraStreamRef.current);
     attachStream(screenSourceRef.current, screenStreamRef.current);
     attachStream(screenPreviewRef.current, screenStreamRef.current);
-  }, [cameraActive, screenActive, mode]);
+  }, [cameraActive, cameraEnabled, screenActive, mode]);
 
   useEffect(() => {
     if (!autoScroll) return;
@@ -747,12 +817,27 @@ export default function Home() {
         : "";
     if (name === "NotAllowedError") {
       setErrorMessage("权限没有开启。请允许浏览器使用摄像头、麦克风或屏幕。");
+    } else if (name === "NotReadableError" || name === "TrackStartError") {
+      setErrorMessage("设备正在被其他页面或应用使用，请先关闭占用后重试。");
     } else if (name === "NotFoundError") {
       setErrorMessage("没有找到可用设备，请检查摄像头或麦克风连接。");
     } else {
       setErrorMessage(fallback);
     }
   };
+
+  const disconnectAudioStreamFromMixer = useCallback((stream: MediaStream) => {
+    const outputStream = recordingOutputStreamRef.current;
+    stream.getAudioTracks().forEach((track) => {
+      const source = audioSourcesRef.current.get(track.id);
+      source?.disconnect();
+      audioSourcesRef.current.delete(track.id);
+      audioTrackIdsRef.current.delete(track.id);
+      if (outputStream?.getTracks().includes(track)) {
+        outputStream.removeTrack(track);
+      }
+    });
+  }, []);
 
   const ensureCamera = useCallback(async () => {
     if (cameraStreamRef.current?.active) return cameraStreamRef.current;
@@ -773,8 +858,11 @@ export default function Home() {
     stream.getVideoTracks()[0]?.addEventListener(
       "ended",
       () => {
+        if (cameraStreamRef.current !== stream) return;
         cameraStreamRef.current = null;
         setCameraActive(false);
+        setCameraEnabled(false);
+        setStatusMessage("摄像头连接已断开，请重新开启摄像头");
       },
       { once: true },
     );
@@ -802,35 +890,47 @@ export default function Home() {
     stream.getAudioTracks()[0]?.addEventListener(
       "ended",
       () => {
+        if (microphoneStreamRef.current !== stream) return;
+        disconnectAudioStreamFromMixer(stream);
         microphoneStreamRef.current = null;
-        setMicrophoneActive(false);
+        setMicrophoneEnabled(false);
+        setStatusMessage("麦克风连接已断开，请重新开启麦克风");
       },
       { once: true },
     );
-    setMicrophoneActive(true);
     return stream;
-  }, []);
+  }, [disconnectAudioStreamFromMixer]);
 
   const openCamera = async () => {
     setErrorMessage("");
     try {
-      await Promise.all([
+      const [cameraStream] = await Promise.all([
         ensureCamera(),
         microphoneEnabled ? ensureMicrophone() : Promise.resolve(null),
       ]);
+      cameraStream.getVideoTracks().forEach((track) => {
+        track.enabled = true;
+      });
+      setCameraEnabled(true);
       setStatusMessage("摄像头已就绪，可以选择屏幕");
     } catch (error) {
       setFriendlyError(error, "摄像头启动失败，请检查浏览器权限。");
     }
   };
 
-  const openScreen = useCallback(async () => {
-    if (screenStreamRef.current?.active) return screenStreamRef.current;
-    if (!navigator.mediaDevices?.getDisplayMedia) {
-      throw new Error("当前浏览器不支持录屏");
+  const openScreen = useCallback((replaceActive = false) => {
+    const previousStream = screenStreamRef.current;
+    if (previousStream?.active && !replaceActive) {
+      return Promise.resolve(previousStream);
     }
+    if (screenOpenPromiseRef.current) return screenOpenPromiseRef.current;
 
-    const options = {
+    const request = (async () => {
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw new Error("当前浏览器不支持录屏");
+      }
+
+      const options: DisplayMediaOptionsWithController = {
       video: {
         frameRate: { ideal: 30, max: 30 },
         width: { ideal: 3840, max: 3840 },
@@ -844,42 +944,89 @@ export default function Home() {
       systemAudio: "include",
       selfBrowserSurface: "exclude",
       surfaceSwitching: "include",
-    } as DisplayMediaStreamOptions;
+    } as DisplayMediaOptionsWithController;
 
-    const stream = await navigator.mediaDevices.getDisplayMedia(options);
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack?.getSettings().displaySurface === "monitor") {
-      stopStream(stream);
-      throw new Error("ENTIRE_SCREEN_SELECTED");
-    }
-
-    screenStreamRef.current = stream;
-    attachStream(screenSourceRef.current, stream);
-    updateCropRegion(FULL_CROP);
-    setCropSelecting(false);
-    if (videoTrack && "contentHint" in videoTrack) {
-      videoTrack.contentHint = "detail";
-    }
-    videoTrack?.addEventListener(
-      "ended",
-      () => {
-        screenStreamRef.current = null;
-        setScreenActive(false);
-        setStatusMessage("屏幕共享已结束");
-        if (mediaRecorderRef.current?.state === "recording") {
-          mediaRecorderRef.current.stop();
+      const CaptureControllerClass = (window as WindowWithCaptureController)
+        .CaptureController;
+      let focusController: CaptureControllerLike | null = null;
+      if (CaptureControllerClass) {
+        try {
+          focusController = new CaptureControllerClass();
+          options.controller = focusController;
+        } catch {
+          focusController = null;
+          delete options.controller;
         }
-      },
-      { once: true },
-    );
-    setScreenActive(true);
-    return stream;
-  }, []);
+      }
+
+      const stream = await navigator.mediaDevices.getDisplayMedia(
+        options as DisplayMediaStreamOptions,
+      );
+      try {
+        focusController?.setFocusBehavior("no-focus-change");
+      } catch {
+        // The focus preference may already have been finalized by the browser.
+      }
+      window.focus();
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack?.getSettings().displaySurface === "monitor") {
+        stopStream(stream);
+        throw new Error("ENTIRE_SCREEN_SELECTED");
+      }
+
+      screenStreamRef.current = stream;
+      attachStream(screenSourceRef.current, stream);
+      attachStream(screenPreviewRef.current, stream);
+      updateCropRegion(FULL_CROP);
+      setCropSelecting(false);
+      if (videoTrack && "contentHint" in videoTrack) {
+        videoTrack.contentHint = "detail";
+      }
+      videoTrack?.addEventListener(
+        "ended",
+        () => {
+          if (screenStreamRef.current !== stream) return;
+          disconnectAudioStreamFromMixer(stream);
+          screenStreamRef.current = null;
+          setScreenActive(false);
+          setStatusMessage("屏幕共享已结束");
+          if (
+            modeRef.current !== "camera" &&
+            mediaRecorderRef.current?.state === "recording"
+          ) {
+            mediaRecorderRef.current.stop();
+          }
+        },
+        { once: true },
+      );
+      setScreenActive(true);
+      if (previousStream && previousStream !== stream) {
+        disconnectAudioStreamFromMixer(previousStream);
+        stopStream(previousStream);
+      }
+      return stream;
+    })();
+
+    screenOpenPromiseRef.current = request;
+    const clearPendingRequest = () => {
+      if (screenOpenPromiseRef.current === request) {
+        screenOpenPromiseRef.current = null;
+      }
+    };
+    void request.then(clearPendingRequest, clearPendingRequest);
+    return request;
+  }, [disconnectAudioStreamFromMixer]);
 
   const selectScreen = async () => {
+    if (screenSelectionPending) return;
+    const hadActiveScreen = Boolean(screenStreamRef.current?.active);
     setErrorMessage("");
+    setScreenSelectionPending(true);
     try {
-      await openScreen();
+      const screenStream = await openScreen(true);
+      if (mediaRecorderRef.current?.state === "recording") {
+        addAudioStreamToMixer(screenStream);
+      }
       if (cameraEnabled) {
         await ensureCamera();
       }
@@ -899,9 +1046,20 @@ export default function Home() {
         setErrorMessage(
           "为了不把提词器录进去，请选择单个窗口或标签页，不要选择整个屏幕。",
         );
+      } else if (
+        typeof error === "object" &&
+        error &&
+        "name" in error &&
+        String((error as { name: unknown }).name) === "AbortError"
+      ) {
+        setStatusMessage(
+          hadActiveScreen ? "已保留原共享画面" : "没有选择共享画面",
+        );
       } else {
         setFriendlyError(error, "没有成功选择屏幕，请再试一次。");
       }
+    } finally {
+      setScreenSelectionPending(false);
     }
   };
 
@@ -915,6 +1073,9 @@ export default function Home() {
         stream.getAudioTracks().forEach((track) => {
           track.enabled = true;
         });
+        if (mediaRecorderRef.current?.state === "recording") {
+          addAudioStreamToMixer(stream);
+        }
         setStatusMessage("麦克风已开启");
       } else {
         microphoneStreamRef.current?.getAudioTracks().forEach((track) => {
@@ -951,34 +1112,18 @@ export default function Home() {
     }
   };
 
-  const getRecordingDimensions = (captureMode: CaptureMode) => {
-    if (captureMode === "camera") {
-      return { width: 1920, height: 1080 };
-    }
-
-    const screen = screenSourceRef.current;
-    const screenTrack = screenStreamRef.current?.getVideoTracks()[0];
-    const settings = screenTrack?.getSettings();
-    const crop = cropRegionRef.current;
-    const sourceWidth =
-      (screen?.videoWidth || settings?.width || 1920) * crop.width;
-    const sourceHeight =
-      (screen?.videoHeight || settings?.height || 1080) * crop.height;
-    const scale = Math.min(1, 3840 / sourceWidth, 2160 / sourceHeight);
-
-    return {
-      width: Math.max(2, Math.floor((sourceWidth * scale) / 2) * 2),
-      height: Math.max(2, Math.floor((sourceHeight * scale) / 2) * 2),
-    };
+  const getRecordingDimensions = () => {
+    const preset = getAspectPreset(recordingAspect);
+    return { width: preset.width, height: preset.height };
   };
 
-  const beginCanvasComposition = (captureMode: CaptureMode) => {
+  const beginCanvasComposition = () => {
     const canvas = recordingCanvasRef.current;
     const camera = cameraSourceRef.current;
     const screen = screenSourceRef.current;
     if (!canvas) throw new Error("录制画布不可用");
 
-    const dimensions = getRecordingDimensions(captureMode);
+    const dimensions = getRecordingDimensions();
     canvas.width = dimensions.width;
     canvas.height = dimensions.height;
     setOutputResolution(`${dimensions.width} × ${dimensions.height}`);
@@ -1002,7 +1147,7 @@ export default function Home() {
         );
       }
 
-      if (activeMode === "composite" && camera && cameraEnabled) {
+      if (activeMode === "composite" && camera && cameraEnabledRef.current) {
         const pip = pipPositionRef.current;
         const pipWidth = canvas.width * pip.width;
         const pipHeight = pipWidth * (9 / 16);
@@ -1125,7 +1270,8 @@ export default function Home() {
   };
 
   const startRecording = async () => {
-    if (isBusy) return;
+    if (isBusy || recordingStartPendingRef.current) return;
+    recordingStartPendingRef.current = true;
     setErrorMessage("");
     setLastRecording((previous) => {
       if (previous?.url) URL.revokeObjectURL(previous.url);
@@ -1140,13 +1286,12 @@ export default function Home() {
       }
       await ensureRecordingDirectory();
 
-      let cameraStream: MediaStream | null = cameraStreamRef.current;
       let screenStream: MediaStream | null = screenStreamRef.current;
       let microphoneStream: MediaStream | null =
         microphoneStreamRef.current;
 
       if (mode === "camera" || mode === "composite" || cameraEnabled) {
-        cameraStream = await ensureCamera();
+        await ensureCamera();
       }
       if (mode === "screen" || mode === "composite") {
         screenStream = await openScreen();
@@ -1159,7 +1304,13 @@ export default function Home() {
       }
 
       await runCountdown();
-      const composition = beginCanvasComposition(mode);
+      if (
+        (mode === "screen" || mode === "composite") &&
+        !screenStreamRef.current?.active
+      ) {
+        throw new Error("SCREEN_SHARE_ENDED");
+      }
+      const composition = beginCanvasComposition();
       const outputStream = composition.stream;
       const audioSources = [
         ...(microphoneEnabled && microphoneStream ? [microphoneStream] : []),
@@ -1217,7 +1368,13 @@ export default function Home() {
 
           const finalMime = recorder.mimeType || mimeType;
           if (!finalMime.toLowerCase().includes("mp4")) {
+            try {
+              window.localStorage.removeItem(INTERRUPTED_RECORDING_KEY);
+            } catch {
+              // Ignore storage cleanup failures.
+            }
             setRecorderState("idle");
+            recordingStartPendingRef.current = false;
             setErrorMessage(
               "浏览器没有生成真正的 MP4 文件，请更新浏览器后再试。",
             );
@@ -1232,9 +1389,15 @@ export default function Home() {
           const stamp = new Date()
             .toISOString()
             .replace(/:/g, "-")
-            .replace(/\.\d{3}Z$/, "");
-          const name = `镜场-${stamp}.mp4`;
-          setLastRecording({ url, name, size: blob.size });
+            .replace(/\.(\d{3})Z$/, "-$1");
+          const uniqueSuffix = window.crypto.randomUUID().slice(0, 6);
+          const name = `镜场-${stamp}-${uniqueSuffix}.mp4`;
+          setLastRecording({
+            url,
+            name,
+            size: blob.size,
+            needsDownload: false,
+          });
           try {
             await saveRecordingToDirectory(blob, name);
             await refreshRecordingLibrary();
@@ -1242,28 +1405,54 @@ export default function Home() {
             setStatusMessage(
               `MP4 已保存到「${directoryHandleRef.current?.name || "录制文件夹"}」`,
             );
-          } catch {
+          } catch (error) {
+            const errorName =
+              typeof error === "object" && error && "name" in error
+                ? String((error as { name: unknown }).name)
+                : "";
+            setLastRecording((previous) =>
+              previous ? { ...previous, needsDownload: true } : previous,
+            );
+            setSidePanel("library");
             setErrorMessage(
-              "MP4 已生成，但没有写入保存文件夹。请点击右侧下载副本。",
+              errorName === "QuotaExceededError"
+                ? "磁盘空间不足，MP4 没有写入文件夹，请立即下载副本。"
+                : errorName === "NotAllowedError"
+                  ? "保存文件夹的写入权限已失效，请立即下载 MP4 副本。"
+                  : "MP4 已生成，但没有写入保存文件夹，请立即下载副本。",
             );
           } finally {
+            try {
+              window.localStorage.removeItem(INTERRUPTED_RECORDING_KEY);
+            } catch {
+              // Ignore storage cleanup failures after finalizing the MP4.
+            }
             setRecorderState("idle");
             mediaRecorderRef.current = null;
+            recordingStartPendingRef.current = false;
           }
         },
         { once: true },
       );
 
       recorder.start(1000);
+      try {
+        window.localStorage.setItem(
+          INTERRUPTED_RECORDING_KEY,
+          "active",
+        );
+      } catch {
+        // The beforeunload guard still protects the active recording.
+      }
       modeRef.current = mode;
       setElapsedSeconds(0);
       setRecorderState("recording");
       setStatusMessage("正在录制 · 所有画面只在本机合成");
-      const startedAt = Date.now();
       timerRef.current = setInterval(() => {
-        setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
-      }, 250);
+        setElapsedSeconds((seconds) => seconds + 1);
+      }, 1000);
     } catch (error) {
+      recordingStartPendingRef.current = false;
       setCountdown(null);
       setRecorderState("idle");
       if (animationFrameRef.current !== null) {
@@ -1288,6 +1477,11 @@ export default function Home() {
         setErrorMessage(
           "为了不把提词器录进去，请重新选择单个窗口或标签页。",
         );
+      } else if (
+        error instanceof Error &&
+        error.message === "SCREEN_SHARE_ENDED"
+      ) {
+        setErrorMessage("屏幕共享已结束，录制没有开始，请重新选择屏幕。");
       } else if (
         typeof error === "object" &&
         error &&
@@ -1359,6 +1553,15 @@ export default function Home() {
         setFriendlyError(error, "没有成功切换录制模式，请再试一次。");
       }
     }
+  };
+
+  const changeRecordingAspect = (nextAspect: RecordingAspect) => {
+    if (isBusy || nextAspect === recordingAspect) return;
+    const preset = getAspectPreset(nextAspect);
+    setRecordingAspect(nextAspect);
+    setOutputResolution(`${preset.width} × ${preset.height}`);
+    setErrorMessage("");
+    setStatusMessage(`已切换为 ${nextAspect} 录制画幅`);
   };
 
   const startCropSelection = () => {
@@ -1567,6 +1770,24 @@ export default function Home() {
                 )}
               </div>
             )}
+            <div className="aspect-selector" aria-label="录制画幅">
+              <small>FRAME / 画幅</small>
+              <div>
+                {ASPECT_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={recordingAspect === preset.id ? "active" : ""}
+                    onClick={() => changeRecordingAspect(preset.id)}
+                    disabled={isBusy}
+                    aria-pressed={recordingAspect === preset.id}
+                    title={`${preset.description} · ${preset.width} × ${preset.height}`}
+                  >
+                    {preset.id}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="mode-tabs" aria-label="录制模式">
               {MODE_LABELS.map((item) => (
                 <button
@@ -1589,10 +1810,17 @@ export default function Home() {
               <span className={screenActive || cameraActive ? "ready" : ""}>
                 {screenActive || cameraActive ? "信号就绪" : "等待信号"}
               </span>
-              <span>MP4 · {outputResolution} · 30 FPS</span>
+              <span>MP4 · {recordingAspect} · {outputResolution} · 30 FPS</span>
             </div>
 
-            <div className="preview-stage" ref={previewRef}>
+            <div className="preview-frame-slot">
+              <div
+                className="preview-stage"
+                ref={previewRef}
+                style={{ aspectRatio: recordingAspect.replace(":", " / ") }}
+                data-aspect={recordingAspect}
+                data-testid="preview-stage"
+              >
               {!showCameraMain && !screenActive && (
                 <div className="empty-preview">
                   <span className="empty-index">01</span>
@@ -1618,6 +1846,7 @@ export default function Home() {
               {showScreen && (
                 <video
                   ref={screenPreviewRef}
+                  data-testid="screen-preview"
                   className={`screen-preview ${screenActive ? "visible" : ""}`}
                   autoPlay
                   muted
@@ -1629,6 +1858,7 @@ export default function Home() {
               {showCameraMain && (
                 <video
                   ref={cameraPreviewRef}
+                  data-testid="camera-preview"
                   className={`camera-main-preview ${
                     cameraActive && cameraEnabled ? "visible" : ""
                   }`}
@@ -1656,6 +1886,7 @@ export default function Home() {
                     onPointerUp={endCropDrag}
                     onPointerCancel={endCropDrag}
                     aria-label="录制区域裁剪层"
+                    data-testid="crop-selection-overlay"
                   >
                     <div
                       className="crop-region"
@@ -1690,6 +1921,7 @@ export default function Home() {
                 >
                   <video
                     ref={cameraPreviewRef}
+                    data-testid="camera-preview"
                     autoPlay
                     muted
                     playsInline
@@ -1734,29 +1966,44 @@ export default function Home() {
                   REC
                 </div>
               )}
+              </div>
             </div>
           </div>
 
           <div className="control-dock">
-            <div className="device-status">
-              <span className={cameraActive && cameraEnabled ? "ready" : ""}>
-                <i /> 摄像头
-              </span>
-              <span
-                className={
-                  microphoneActive && microphoneEnabled ? "ready" : ""
-                }
-              >
-                <i /> 麦克风
-              </span>
-              <span className={screenActive ? "ready" : ""}>
-                <i /> 屏幕
-              </span>
-              <span className={mp4Ready ? "ready" : "unsupported"}>
-                <i /> {mp4Ready === null ? "检测格式" : mp4Ready ? "MP4" : "MP4 不可用"}
-              </span>
-              <span className={directoryName ? "ready" : ""}>
-                <i /> {directoryName || "未选文件夹"}
+            <div className="device-workspace" aria-label="设备控制与状态">
+              <div className="device-controls">
+                <div className="device-control-item">
+                  <span className="device-name">摄像头</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    onClick={toggleCamera}
+                    className={`device-toggle ${cameraEnabled ? "active" : ""}`}
+                    aria-checked={cameraEnabled}
+                    aria-label={cameraEnabled ? "关闭摄像头" : "开启摄像头"}
+                    disabled={recorderState === "countdown" || recorderState === "processing"}
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                </div>
+                <div className="device-control-item">
+                  <span className="device-name">麦克风</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    onClick={toggleMicrophone}
+                    className={`device-toggle ${microphoneEnabled ? "active" : ""}`}
+                    aria-checked={microphoneEnabled}
+                    aria-label={microphoneEnabled ? "静音麦克风" : "开启麦克风"}
+                    disabled={recorderState === "countdown" || recorderState === "processing"}
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+              <span className="visually-hidden" aria-live="polite">
+                {errorMessage || statusMessage}
               </span>
             </div>
 
@@ -1766,18 +2013,29 @@ export default function Home() {
                 type="button"
                 onClick={openCamera}
                 disabled={isBusy}
+                data-testid="open-camera"
               >
-                <span className="button-kicker">STEP 1</span>
-                {cameraActive ? "摄像头已开启" : "开启摄像头"}
+                <span className="button-kicker">步骤 1</span>
+                开启摄像头
               </button>
               <button
                 className="setup-button"
                 type="button"
                 onClick={selectScreen}
-                disabled={isBusy || mode === "camera"}
+                disabled={
+                  recorderState === "countdown" ||
+                  recorderState === "processing" ||
+                  mode === "camera" ||
+                  screenSelectionPending
+                }
+                aria-busy={screenSelectionPending}
               >
-                <span className="button-kicker">STEP 2</span>
-                {screenActive ? "重新选择屏幕" : "选择屏幕"}
+                <span className="button-kicker">步骤 2</span>
+                {screenSelectionPending
+                  ? "正在选择屏幕…"
+                  : screenActive
+                    ? "重新选择屏幕"
+                    : "选择屏幕"}
               </button>
               <button
                 className={`record-button ${isRecording ? "stop" : ""}`}
@@ -1791,49 +2049,15 @@ export default function Home() {
                     {isRecording
                       ? formatTime(elapsedSeconds)
                       : recorderState === "processing"
-                        ? "处理中"
-                        : "STEP 3"}
+                      ? "处理中"
+                        : "步骤 3"}
                   </small>
                   {isRecording ? "停止录制" : "开始录制"}
                 </span>
               </button>
             </div>
-
-            <div className="quick-toggles">
-              <button
-                type="button"
-                onClick={toggleMicrophone}
-                className={microphoneEnabled ? "active" : ""}
-                aria-pressed={microphoneEnabled}
-                disabled={isBusy}
-              >
-                MIC {microphoneEnabled ? "ON" : "OFF"}
-              </button>
-              <button
-                type="button"
-                onClick={toggleCamera}
-                className={cameraEnabled ? "active" : ""}
-                aria-pressed={cameraEnabled}
-                disabled={isBusy}
-              >
-                CAM {cameraEnabled ? "ON" : "OFF"}
-              </button>
-            </div>
           </div>
 
-          <div className="status-line" aria-live="polite">
-            <span>{errorMessage || statusMessage}</span>
-            {lastRecording && (
-              <div className="status-actions">
-                <button type="button" onClick={() => setSidePanel("library")}>
-                  查看录制库
-                </button>
-                <a href={lastRecording.url} download={lastRecording.name}>
-                  下载副本 · {formatBytes(lastRecording.size)}
-                </a>
-              </div>
-            )}
-          </div>
         </section>
 
         <aside
@@ -2006,6 +2230,17 @@ export default function Home() {
                         : "选择保存文件夹"}
                   </button>
                 </section>
+
+                {lastRecording?.needsDownload && (
+                  <section className="recording-rescue" role="alert">
+                    <p className="eyebrow">UNSAVED MP4 / 待下载副本</p>
+                    <strong>{lastRecording.name}</strong>
+                    <span>{formatBytes(lastRecording.size)} · 尚未写入保存文件夹</span>
+                    <a href={lastRecording.url} download={lastRecording.name}>
+                      下载 MP4 副本
+                    </a>
+                  </section>
+                )}
 
                 {directoryName && !directoryNeedsPermission && (
                   <div className="library-list">
