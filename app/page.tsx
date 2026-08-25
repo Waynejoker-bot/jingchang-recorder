@@ -2146,7 +2146,7 @@ export default function Home() {
                   <input
                     id="scroll-speed"
                     type="range"
-                    min="1"
+                    min="0.5"
                     max="5"
                     step="0.5"
                     value={scrollSpeed}
