@@ -23485,7 +23485,7 @@
                         type: "range",
                         min: "1",
                         max: "5",
-                        step: "1",
+                        step: "0.5",
                         value: scrollSpeed,
                         onChange: (event) => setScrollSpeed(Number(event.target.value))
                       }
